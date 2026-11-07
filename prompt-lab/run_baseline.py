@@ -1,3 +1,5 @@
+import argparse
+import hashlib
 import json
 import os
 import sys
@@ -24,7 +26,7 @@ UNKNOWN = "unknown"
 SCORED_FIELDS = ["service", "severity", "cause_category"]
 ALL_FIELDS = SCORED_FIELDS + ["next_step"]
 
-PROMPT_TEMPLATE = """You are an SRE triaging an incoming alert.
+_PROMPT_HEAD = """You are an SRE triaging an incoming alert.
 
 Respond with ONLY a JSON object, no markdown fences and no other text, with exactly these keys:
 - "service": the name of the affected service, string
@@ -32,15 +34,28 @@ Respond with ONLY a JSON object, no markdown fences and no other text, with exac
 - "cause_category": one of "resource_exhaustion", "dependency_failure", "bad_deploy", "config_error", "network", "capacity", "unknown"
 - "next_step": the single most useful next action for the on-call engineer, one sentence
 
-Severity rubric:
+"""
+
+_SEVERITY_RUBRIC_BLOCK = """Severity rubric:
 critical: customer-facing outage or data loss happening now
 high: degraded user impact or an imminent outage
 medium: no user impact yet, needs action within hours
 low: informational or noise
 unknown: not enough information
 
-Alert:
+"""
+
+_PROMPT_TAIL = """Alert:
 {alert_text}"""
+
+# The two variants differ only by the severity rubric block.
+PROMPT_BASELINE = _PROMPT_HEAD + _PROMPT_TAIL
+PROMPT_RUBRIC = _PROMPT_HEAD + _SEVERITY_RUBRIC_BLOCK + _PROMPT_TAIL
+PROMPTS = {"baseline": PROMPT_BASELINE, "rubric": PROMPT_RUBRIC}
+
+
+def sha256_hex(data):
+    return hashlib.sha256(data).hexdigest()
 
 
 def load_alerts(path):
@@ -89,15 +104,17 @@ def parse_output(raw):
     return parsed, None
 
 
-def classify_alert(client, alert):
+def classify_alert(client, alert, prompt, meta):
     result = {
         "id": alert["id"],
+        **meta,
         "raw_output": None,
         "parsed": None,
         "label": alert["labels"],
         "match": {f: False for f in SCORED_FIELDS},
         "severity_within_one": False,
         "stop_reason": None,
+        "flagged_stop_reason": True,  # True unless stop_reason is "end_turn"
         "input_tokens": 0,
         "output_tokens": 0,
         "cost_usd": 0.0,
@@ -110,7 +127,7 @@ def classify_alert(client, alert):
             messages=[
                 {
                     "role": "user",
-                    "content": PROMPT_TEMPLATE.format(alert_text=alert["text"]),
+                    "content": prompt.format(alert_text=alert["text"]),
                 }
             ],
         )
@@ -120,6 +137,7 @@ def classify_alert(client, alert):
 
     result["raw_output"] = "".join(b.text for b in resp.content if b.type == "text")
     result["stop_reason"] = resp.stop_reason
+    result["flagged_stop_reason"] = resp.stop_reason != "end_turn"
     result["input_tokens"] = resp.usage.input_tokens
     result["output_tokens"] = resp.usage.output_tokens
     result["cost_usd"] = cost_usd(resp.usage.input_tokens, resp.usage.output_tokens)
@@ -141,32 +159,65 @@ def classify_alert(client, alert):
     return result
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Run the alert triage eval.")
+    parser.add_argument(
+        "--variant",
+        required=True,
+        choices=sorted(PROMPTS),
+        help="which prompt to run; no default, so the wrong one cannot run by accident",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the prompt and hashes, then exit without calling the API",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+    prompt = PROMPTS[args.variant]
+    meta = {
+        "variant": args.variant,
+        "prompt_sha256": sha256_hex(prompt.encode()),
+        "labels_sha256": sha256_hex(ALERTS_PATH.read_bytes()),
+        "model": MODEL,
+        "max_tokens": MAX_TOKENS,
+    }
+    alerts = load_alerts(ALERTS_PATH)
+
+    print(f"Variant: {args.variant}  model: {MODEL}  max_tokens: {MAX_TOKENS}  alerts: {len(alerts)}")
+    print(f"prompt_sha256: {meta['prompt_sha256']}")
+    print(f"labels_sha256: {meta['labels_sha256']}")
+    print("=" * 72)
+    print("PROMPT (identical for every alert; {alert_text} is replaced per alert):")
+    print("-" * 72)
+    print(prompt)
+    print("=" * 72)
+
+    if args.dry_run:
+        return
+
     if not os.environ.get("ANTHROPIC_API_KEY"):
         sys.exit("ANTHROPIC_API_KEY is not set in the environment")
 
     client = anthropic.Anthropic()
-    alerts = load_alerts(ALERTS_PATH)
-
-    print(f"Model: {MODEL}  max_tokens: {MAX_TOKENS}  alerts: {len(alerts)}")
-    print("=" * 72)
-    print("PROMPT (identical for every alert; {alert_text} is replaced per alert):")
-    print("-" * 72)
-    print(PROMPT_TEMPLATE)
-    print("=" * 72)
 
     RESULTS_DIR.mkdir(exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_path = RESULTS_DIR / f"baseline_{stamp}.jsonl"
+    out_path = RESULTS_DIR / f"{args.variant}_{stamp}.jsonl"
 
     results = []
     with open(out_path, "w") as out:
         for alert in alerts:
-            r = classify_alert(client, alert)
+            r = classify_alert(client, alert, prompt, meta)
             results.append(r)
             out.write(json.dumps(r) + "\n")
             out.flush()
 
+            if r["flagged_stop_reason"]:
+                print(f"[{r['id']}] FLAG stop_reason={r['stop_reason']!r} (expected 'end_turn')")
             if r["error"]:
                 print(f"[{r['id']}] ERROR {r['error']}")
                 if r["raw_output"] is not None:
