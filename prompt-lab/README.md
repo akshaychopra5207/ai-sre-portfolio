@@ -56,6 +56,6 @@
 
 ## Lessons
 
-1. **The rubric did not improve severity accuracy:** 38/66 (57.6%) exact vs 55/88 (62.5%) for baseline. Per-run severity ranges overlap (rubric 11-14/22, baseline 12-15/22), and the rubric costs more ($0.004303 vs $0.003181 average per run).
-2. **The rubric moved errors around instead of removing them:** severity hits on alert-002 went 0/4 to 2/3, alert-003 1/4 to 3/3, alert-004 0/4 to 3/3. It got worse on the noisy and ambiguous alerts: alert-007 4/4 to 0/3, alert-010 4/4 to 1/3, alert-009 2/4 to 0/3, alert-013 1/4 to 0/3. alert-012 (critical) stayed `high` in all 7 runs from 2 on.
-3. **Nonsense alerts, no invented causes:** cause_category was `unknown` in all 14 outputs (runs 2-8). Without an `unknown` severity option (run 2) the model picked `medium` for both; in runs 3-8 it answered `unknown` in all 12 outputs. alert-021's service was echoed as `xk_check_7` in runs 3-5 (a miss against label `unknown`) but was `unknown` in all three rubric runs.
+1. Rubric lifted exact severity from 14.0 to 16.0 out of 22 per run, but the ranges touch (15 vs 15). Not conclusive at n=5.
+2. About two-thirds of the gain comes from two alerts whose labels were rewritten from the rubric after seeing results. Without them the gain is about +0.6 per run. Labels written from the rubric favor the rubric by design.
+3. The rubric fixes under-calling of clear cases (002-004) and costs accuracy on ambiguous low alerts (010, 013), and within-one fell. Only one critical alert exists, so critical is effectively untested.
